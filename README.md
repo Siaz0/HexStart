@@ -41,7 +41,7 @@ Why HEXSINTEL?
 
 Many investigations involve jumping between multiple tools, notes, and references.
 
-HEXSTART aims to simplify that process by providing a unified workspace where artifacts can be analyzed, findings organized, and investigations documented without leaving the terminal.
+HEXINTEL aims to simplify that process by providing a unified workspace where artifacts can be analyzed, findings organized, and investigations documented without leaving the terminal.
 
 Use Cases
 
