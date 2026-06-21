@@ -1,6 +1,6 @@
-# HEXINTEL
+# HEXSTART
 
-HEXINTEL is a lightweight investigation and analysis toolkit designed for terminal environments, including Linux and iSH.
+HEXSTART is a lightweight investigation and analysis toolkit designed for terminal environments, including Linux and iSH.
 
 Built for researchers, developers, analysts, and security enthusiasts, HEXSTART combines artifact decoding, investigation workflows, knowledge matching, and case management into a single command-line interface.
 
@@ -37,11 +37,11 @@ Lightweight Design
 * iSH compatible
 * Minimal resource usage
 
-Why HEXSINTEL?
+Why HEXSTART?
 
 Many investigations involve jumping between multiple tools, notes, and references.
 
-HEXINTEL aims to simplify that process by providing a unified workspace where artifacts can be analyzed, findings organized, and investigations documented without leaving the terminal.
+HEXSTART aims to simplify that process by providing a unified workspace where artifacts can be analyzed, findings organized, and investigations documented without leaving the terminal.
 
 Use Cases
 
