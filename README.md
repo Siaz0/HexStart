@@ -58,4 +58,11 @@ Fast.
 Lightweight.
 Portable.
 
+Requirements
+
+* Python 3.10+
+* Linux or iSH
+
+No external dependencies required.
+
 Built for people who prefer solving problems from the command line.
