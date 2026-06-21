@@ -37,7 +37,7 @@ Lightweight Design
 * iSH compatible
 * Minimal resource usage
 
-Why HEXSTART?
+Why HEXSINTEL?
 
 Many investigations involve jumping between multiple tools, notes, and references.
 
