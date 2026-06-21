@@ -1,0 +1,567 @@
+#!/bin/sh
+# ============================================================
+# HEXSTART — unified hex investigation toolkit
+# Merges: hexstart, hexstart.sh, hexstart-ai.sh, hexstart-case.sh
+# POSIX sh / BusyBox-compatible (built for iSH).
+# ============================================================
+
+set -u
+
+DB_DIR="$HOME/.hexstart"
+CASES_DIR="$DB_DIR/cases"
+KB_FILE="$DB_DIR/knowledge.db"
+TMP="/tmp/hexstart.$$.bin"
+
+mkdir -p "$CASES_DIR"
+[ -f "$KB_FILE" ] || : > "$KB_FILE"
+
+trap 'rm -f "$TMP"' EXIT INT TERM
+
+# ------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------
+
+err() { echo "[ERROR] $*" >&2; }
+
+# Clean + validate hex; sets $CLEAN_HEX or returns 1
+clean_hex() {
+    h=$(echo "$1" | tr -d ' \t\r\n' | tr 'A-F' 'a-f')
+    if [ -z "$h" ]; then
+        err "empty hex input"
+        return 1
+    fi
+    case "$h" in
+        *[!0-9a-f]*)
+            err "input contains non-hex characters"
+            return 1
+            ;;
+    esac
+    len=${#h}
+    if [ $((len % 2)) -ne 0 ]; then
+        err "odd number of hex digits ($len) — incomplete byte"
+        return 1
+    fi
+    CLEAN_HEX="$h"
+    return 0
+}
+
+# Write hex to the shared $TMP binary file
+hex_to_bin() {
+    if ! echo "$1" | xxd -r -p > "$TMP" 2>/dev/null; then
+        err "xxd failed to decode hex"
+        return 1
+    fi
+    return 0
+}
+
+reverse_hex() {
+    echo "$1" | fold -w2 | awk '{a[NR]=$0} END{for(i=NR;i>=1;i--) printf "%s", a[i]}'
+    echo
+}
+
+# Hex byte -> decimal, pure POSIX awk (no strtonum, BusyBox-safe)
+hex_byte_table_awk='
+BEGIN {
+    s = "0123456789abcdef"
+    for (i = 1; i <= 16; i++) hexval[substr(s, i, 1)] = i - 1
+}
+'
+
+# Binary (8-bit) view of each hex byte, BusyBox-safe (no bc dependency)
+to_binary() {
+    echo "$1" | fold -w2 | awk "$hex_byte_table_awk"'
+    {
+        byte = $0
+        h1 = substr(byte,1,1); h2 = substr(byte,2,1)
+        dec = hexval[h1]*16 + hexval[h2]
+        bin = ""
+        n = dec
+        for (i = 0; i < 8; i++) {
+            bin = (n % 2) bin
+            n = int(n / 2)
+        }
+        printf "%s\n", bin
+    }'
+}
+
+byte_breakdown() {
+    echo "$1" | fold -w2 | awk "$hex_byte_table_awk"'
+    {
+        byte = $0
+        h1 = substr(byte,1,1); h2 = substr(byte,2,1)
+        dec = hexval[h1]*16 + hexval[h2]
+        if (dec >= 32 && dec <= 126) { char = sprintf("%c", dec) } else { char = "." }
+        printf "%04d  %-4s  %-3d  %s\n", NR-1, byte, dec, char
+    }'
+}
+
+count_control_bytes() {
+    # $1 = path to binary file
+    xxd -p -c1 "$1" 2>/dev/null | grep -Ec '^(0[0-9a-f]|1[0-9a-f])$'
+}
+
+# ------------------------------------------------------------
+# Core analysis (used by `investigate` and full report)
+# ------------------------------------------------------------
+
+analyze() {
+    # Requires $TMP already populated
+    ASCII=$(strings "$TMP" 2>/dev/null)
+    TOTAL=$(wc -c < "$TMP" | tr -d ' ')
+    CTRL=$(count_control_bytes "$TMP")
+
+    ANDROID=0 DATABASE=0 NETWORK=0 SIM=0 ARCHIVE=0
+
+    SIG=$(xxd -p -l 16 "$TMP" 2>/dev/null | tr -d '\n')
+    FTYPE="Unknown"
+    case "$SIG" in
+        89504e47*) FTYPE="PNG Image" ;;
+        ffd8ff*)   FTYPE="JPEG Image" ;;
+        25504446*) FTYPE="PDF Document" ;;
+        504b0304*) FTYPE="ZIP/APK Archive"; ARCHIVE=100 ;;
+        7f454c46*) FTYPE="ELF Executable" ;;
+        4d5a*)     FTYPE="Windows EXE/DLL (MZ)" ;;
+        53514c69*) FTYPE="SQLite Database" ;;
+    esac
+
+    URLS=$(echo "$ASCII" | grep -Eoi 'https?://[A-Za-z0-9._~:/?#@!$&'"'"'()*+,;=%-]+')
+    EMAILS=$(echo "$ASCII" | grep -Eoi '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}')
+    UUIDS=$(echo "$ASCII" | grep -Eoi '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+
+    echo "$ASCII" | grep -qi "android" && ANDROID=$((ANDROID+80))
+    echo "$ASCII" | grep -qi "google"  && ANDROID=$((ANDROID+20))
+    echo "$ASCII" | grep -qi "sqlite"  && DATABASE=$((DATABASE+80))
+    echo "$ASCII" | grep -qi "table"   && DATABASE=$((DATABASE+20))
+    echo "$ASCII" | grep -qi "http"    && NETWORK=$((NETWORK+80))
+    echo "$ASCII" | grep -qi "https"   && NETWORK=$((NETWORK+20))
+    echo "$ASCII" | grep -qi "dns"     && NETWORK=$((NETWORK+30))
+    echo "$ASCII" | grep -qi "tls"     && NETWORK=$((NETWORK+30))
+    echo "$ASCII" | grep -qi "imsi"    && SIM=$((SIM+90))
+    echo "$ASCII" | grep -qi "iccid"   && SIM=$((SIM+90))
+    echo "$ASCII" | grep -qi "mcc"     && SIM=$((SIM+30))
+    echo "$ASCII" | grep -qi "mnc"     && SIM=$((SIM+30))
+
+    if [ "$TOTAL" -gt 0 ] && [ "$CTRL" -gt 0 ]; then
+        ANDROID=$((ANDROID+5))
+        DATABASE=$((DATABASE+5))
+    fi
+
+    MAX=0
+    RESULT="Unknown Structured Data"
+    for entry in "Android:$ANDROID" "Database:$DATABASE" "Network:$NETWORK" "SIM:$SIM" "Archive:$ARCHIVE"; do
+        NAME=${entry%%:*}
+        VAL=${entry##*:}
+        if [ "$VAL" -gt "$MAX" ]; then MAX=$VAL; RESULT=$NAME; fi
+    done
+
+    echo
+    echo "[FILE SIGNATURE]"
+    echo "Detected Type: $FTYPE"
+
+    echo
+    echo "[STATISTICS]"
+    echo "Bytes        : $TOTAL"
+    echo "Control Bytes: $CTRL"
+
+    echo
+    echo "[CONFIDENCE SCORES]"
+    echo "Android Data : $ANDROID%"
+    echo "Database     : $DATABASE%"
+    echo "Network      : $NETWORK%"
+    echo "SIM/Telecom  : $SIM%"
+    echo "Archive      : $ARCHIVE%"
+
+    if [ -n "$URLS" ]; then echo; echo "[URLs]"; echo "$URLS"; fi
+    if [ -n "$EMAILS" ]; then echo; echo "[Emails]"; echo "$EMAILS"; fi
+    if [ -n "$UUIDS" ]; then echo; echo "[UUIDs]"; echo "$UUIDS"; fi
+
+    echo
+    echo "[CLASSIFICATION]"
+    echo "Most Likely : $RESULT"
+    echo "Confidence  : $MAX%"
+
+    echo
+    echo "[EXPLAIN LIKE I'M 15]"
+    if [ "$MAX" -eq 0 ]; then
+        echo "This data looks machine-generated. It doesn't resemble"
+        echo "a sentence, website, email, or common file — think of it"
+        echo "like a barcode: useful to software, opaque to people."
+    else
+        case "$RESULT" in
+            Android)  echo "Looks related to software running on a mobile device." ;;
+            Database) echo "Resembles a record stored inside a database." ;;
+            Network)  echo "Appears related to data moving across a network." ;;
+            SIM)      echo "Resembles identifiers used by mobile carriers." ;;
+            Archive)  echo "Looks like a compressed file or app package." ;;
+            *)        echo "Unknown machine-generated data." ;;
+        esac
+    fi
+
+    # Make these available to caller for knowledge-base writes
+    LAST_RESULT="$RESULT"
+    LAST_MAX="$MAX"
+}
+
+# ------------------------------------------------------------
+# Knowledge base (used by `investigate` + auto-learn on investigate-full)
+# Format per line: CLASS|LEN|PREFIX16|HEX
+# ------------------------------------------------------------
+
+kb_add() {
+    # $1=class $2=hex
+    class="$1"; hex="$2"
+    len=${#hex}
+    prefix=$(echo "$hex" | cut -c1-16)
+    echo "${class}|${len}|${prefix}|${hex}" >> "$KB_FILE"
+}
+
+kb_investigate() {
+    hex="$1"
+    len=${#hex}
+    prefix=$(echo "$hex" | cut -c1-16)
+
+    if [ ! -s "$KB_FILE" ]; then
+        echo "Knowledge base is empty — no prior samples to compare against."
+        echo "(Samples get added automatically when you run 'investigate-full' and confirm a classification.)"
+        return
+    fi
+
+    found=0
+    while IFS='|' read -r class klen kprefix khex; do
+        [ -z "${class:-}" ] && continue
+        score=0
+        [ "$prefix" = "$kprefix" ] && score=$((score+50))
+        diff=$((len - klen))
+        [ "$diff" -lt 0 ] && diff=$((-diff))
+        [ "$diff" -lt 20 ] && score=$((score+20))
+        [ "$hex" = "$khex" ] && score=100
+
+        if [ "$score" -gt 0 ]; then
+            found=1
+            echo "Match Found — Type: $class  Confidence: ${score}%"
+        fi
+    done < "$KB_FILE"
+
+    [ "$found" -eq 0 ] && echo "No similar samples found in knowledge base."
+}
+
+# ------------------------------------------------------------
+# Case book
+# ------------------------------------------------------------
+
+case_save() {
+    hex="$1"
+    base=$(date +%s)
+    id="$base"
+    n=0
+    # Guard against two cases saved in the same second (date +%s has 1s resolution)
+    while [ -f "$CASES_DIR/$id.case" ]; do
+        n=$((n+1))
+        id="${base}-${n}"
+    done
+    file="$CASES_DIR/$id.case"
+    echo "$hex" > "$file"
+    echo
+    echo "Case Saved — ID: $id"
+    echo
+}
+
+case_list() {
+    echo
+    echo "=== CASE DATABASE ==="
+    echo
+    set -- "$CASES_DIR"/*.case
+    if [ ! -e "$1" ]; then
+        echo "No cases yet."
+        return
+    fi
+    for f in "$CASES_DIR"/*.case; do
+        [ -f "$f" ] || continue
+        id=$(basename "$f" .case)
+        hex=$(cat "$f")
+        echo "Case: $id"
+        echo "Hex : $(echo "$hex" | cut -c1-40)..."
+        echo
+    done
+}
+
+case_view() {
+    file="$CASES_DIR/$1.case"
+    if [ ! -f "$file" ]; then
+        echo "Case not found"
+        return
+    fi
+    hex=$(cat "$file")
+    echo
+    echo "Case ID: $1"
+    echo
+    echo "[HEX]"
+    echo "$hex"
+    echo
+    echo "[ASCII]"
+    if clean_hex "$hex" && hex_to_bin "$CLEAN_HEX"; then
+        strings "$TMP"
+    fi
+    echo
+}
+
+case_compare() {
+    a="$CASES_DIR/$1.case"
+    b="$CASES_DIR/$2.case"
+    [ -f "$a" ] || { echo "Case $1 not found"; return; }
+    [ -f "$b" ] || { echo "Case $2 not found"; return; }
+
+    ha=$(cat "$a")
+    hb=$(cat "$b")
+    lena=${#ha}
+    lenb=${#hb}
+
+    echo
+    echo "Case A Length: $lena"
+    echo "Case B Length: $lenb"
+
+    shorter=$lena
+    [ "$lenb" -lt "$shorter" ] && shorter=$lenb
+
+    prefix=0
+    i=1
+    while [ "$i" -le "$shorter" ]; do
+        ca=$(echo "$ha" | cut -c"$i")
+        cb=$(echo "$hb" | cut -c"$i")
+        [ "$ca" = "$cb" ] || break
+        prefix=$((prefix+1))
+        i=$((i+1))
+    done
+
+    echo
+    echo "Shared Prefix: $prefix characters"
+    echo
+}
+
+# ------------------------------------------------------------
+# Prompted single-shot input (used by CLI args mode)
+# ------------------------------------------------------------
+
+prompt_hex() {
+    printf "Paste Hex: "
+    read -r raw
+    if ! clean_hex "$raw"; then
+        exit 1
+    fi
+}
+
+# ============================================================
+# Dispatcher
+# ============================================================
+
+cmd="${1:-menu}"
+
+case "$cmd" in
+
+    decode)
+        [ -n "${2:-}" ] && raw="$2" || { printf "Paste Hex: "; read -r raw; }
+        clean_hex "$raw" || exit 1
+        hex_to_bin "$CLEAN_HEX" && cat "$TMP"
+        ;;
+
+    reverse)
+        [ -n "${2:-}" ] && raw="$2" || { printf "Paste Hex: "; read -r raw; }
+        clean_hex "$raw" || exit 1
+        reverse_hex "$CLEAN_HEX"
+        ;;
+
+    ascii)
+        [ -n "${2:-}" ] && raw="$2" || { printf "Paste Hex: "; read -r raw; }
+        clean_hex "$raw" || exit 1
+        hex_to_bin "$CLEAN_HEX" && strings "$TMP"
+        ;;
+
+    bytes)
+        [ -n "${2:-}" ] && raw="$2" || { printf "Paste Hex: "; read -r raw; }
+        clean_hex "$raw" || exit 1
+        byte_breakdown "$CLEAN_HEX"
+        ;;
+
+    binary)
+        [ -n "${2:-}" ] && raw="$2" || { printf "Paste Hex: "; read -r raw; }
+        clean_hex "$raw" || exit 1
+        to_binary "$CLEAN_HEX"
+        ;;
+
+    investigate)
+        [ -n "${2:-}" ] && raw="$2" || { printf "Paste Hex: "; read -r raw; }
+        clean_hex "$raw" || exit 1
+        hex_to_bin "$CLEAN_HEX" || exit 1
+        echo
+        echo "[ASCII]"
+        strings "$TMP"
+        echo
+        echo "[FILE]"
+        file "$TMP"
+        echo
+        echo "[HEX]"
+        xxd "$TMP"
+        ;;
+
+    investigate-full)
+        [ -n "${2:-}" ] && raw="$2" || { printf "Paste Hex: "; read -r raw; }
+        clean_hex "$raw" || exit 1
+        hex_to_bin "$CLEAN_HEX" || exit 1
+        echo
+        echo "[ASCII]"
+        cat "$TMP"
+        echo
+        analyze
+        echo
+        echo "[REVERSED HEX]"
+        reverse_hex "$CLEAN_HEX"
+        printf "\nSave this sample to the knowledge base as '%s'? [y/N]: " "$LAST_RESULT"
+        read -r ans
+        case "$ans" in
+            y|Y) kb_add "$LAST_RESULT" "$CLEAN_HEX"; echo "Saved to knowledge base." ;;
+        esac
+        echo
+        echo "Investigation Complete."
+        ;;
+
+    kb-match)
+        [ -n "${2:-}" ] && raw="$2" || { printf "Paste Hex: "; read -r raw; }
+        clean_hex "$raw" || exit 1
+        echo
+        kb_investigate "$CLEAN_HEX"
+        ;;
+
+    kb-add)
+        if [ -z "${2:-}" ] || [ -z "${3:-}" ]; then
+            echo "Usage: hexstart kb-add <class> <hex>"
+            exit 1
+        fi
+        clean_hex "$3" || exit 1
+        kb_add "$2" "$CLEAN_HEX"
+        echo "Added to knowledge base under class: $2"
+        ;;
+
+    case-new)
+        [ -n "${2:-}" ] && raw="$2" || { printf "Paste Hex: "; read -r raw; }
+        clean_hex "$raw" || exit 1
+        case_save "$CLEAN_HEX"
+        ;;
+
+    case-list)
+        case_list
+        ;;
+
+    case-view)
+        if [ -z "${2:-}" ]; then printf "Case ID: "; read -r id; else id="$2"; fi
+        case_view "$id"
+        ;;
+
+    case-compare)
+        if [ -z "${2:-}" ] || [ -z "${3:-}" ]; then
+            printf "Case A: "; read -r a
+            printf "Case B: "; read -r b
+        else
+            a="$2"; b="$3"
+        fi
+        case_compare "$a" "$b"
+        ;;
+
+    menu|"")
+        while true; do
+            clear
+            echo "================================="
+            echo "         HEXSTART"
+            echo "================================="
+            echo
+            echo "1. Decode"
+            echo "2. Reverse Hex"
+            echo "3. ASCII"
+            echo "4. Byte Viewer"
+            echo "5. Binary Viewer"
+            echo "6. Investigate (quick)"
+            echo "7. Investigate (full AI report)"
+            echo "8. Knowledge Base Match"
+            echo "9. Case Book"
+            echo "0. Exit"
+            echo
+            printf "Choice: "
+            read -r ch
+
+            case "$ch" in
+                1) prompt_hex; hex_to_bin "$CLEAN_HEX" && cat "$TMP"; echo; read -r _ ;;
+                2) prompt_hex; reverse_hex "$CLEAN_HEX"; read -r _ ;;
+                3) prompt_hex; hex_to_bin "$CLEAN_HEX" && strings "$TMP"; read -r _ ;;
+                4) prompt_hex; byte_breakdown "$CLEAN_HEX"; read -r _ ;;
+                5) prompt_hex; to_binary "$CLEAN_HEX"; read -r _ ;;
+                6)
+                    prompt_hex
+                    hex_to_bin "$CLEAN_HEX" || { read -r _; continue; }
+                    echo; echo "[ASCII]"; strings "$TMP"
+                    echo; echo "[FILE]"; file "$TMP"
+                    echo; echo "[HEX]"; xxd "$TMP"
+                    read -r _
+                    ;;
+                7)
+                    prompt_hex
+                    hex_to_bin "$CLEAN_HEX" || { read -r _; continue; }
+                    echo; echo "[ASCII]"; cat "$TMP"; echo
+                    analyze
+                    echo; echo "[REVERSED HEX]"; reverse_hex "$CLEAN_HEX"
+                    printf "\nSave this sample to the knowledge base as '%s'? [y/N]: " "$LAST_RESULT"
+                    read -r ans
+                    case "$ans" in
+                        y|Y) kb_add "$LAST_RESULT" "$CLEAN_HEX"; echo "Saved." ;;
+                    esac
+                    read -r _
+                    ;;
+                8)
+                    prompt_hex
+                    echo
+                    kb_investigate "$CLEAN_HEX"
+                    read -r _
+                    ;;
+                9)
+                    while true; do
+                        clear
+                        echo "================================="
+                        echo "      HEXSTART CASEBOOK"
+                        echo "================================="
+                        echo
+                        echo "1. New Case"
+                        echo "2. List Cases"
+                        echo "3. View Case"
+                        echo "4. Compare Cases"
+                        echo "5. Back"
+                        echo
+                        printf "Choice: "
+                        read -r cch
+                        case "$cch" in
+                            1) printf "Paste Hex: "; read -r raw; clean_hex "$raw" && case_save "$CLEAN_HEX"; read -r _ ;;
+                            2) case_list; read -r _ ;;
+                            3) printf "Case ID: "; read -r id; case_view "$id"; read -r _ ;;
+                            4)
+                                printf "Case A: "; read -r a
+                                printf "Case B: "; read -r b
+                                case_compare "$a" "$b"
+                                read -r _
+                                ;;
+                            5) break ;;
+                        esac
+                    done
+                    ;;
+                0) exit 0 ;;
+            esac
+        done
+        ;;
+
+    *)
+        echo "Unknown command: $cmd"
+        echo
+        echo "Usage: hexstart [command] [hex]"
+        echo "Commands: decode reverse ascii bytes binary"
+        echo "          investigate investigate-full kb-match kb-add"
+        echo "          case-new case-list case-view case-compare"
+        echo "          menu (default, interactive)"
+        exit 1
+        ;;
+esac
